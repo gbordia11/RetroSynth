@@ -35,10 +35,25 @@ class RendererConfig:
 
 
 @dataclass
+class ValidatorConfig:
+    """Agent 5: route validator. An LLM calls tools (repeat-unit check, mass balance, ORCA)."""
+
+    enabled: bool = False  # runs only for polymer targets ([*] end points) when True
+    model: str = "anthropic/claude-sonnet-5-5"
+    max_tokens: int = 4000
+    max_iters: int = 6  # tool-calling steps before the agent must answer
+    orca_path: str = "orca"  # binary name on PATH, or full path
+    method: str = "B3LYP D3BJ def2-SVP Opt TightSCF"  # ORCA keyword line
+    timeout: int = 900  # seconds per ORCA run
+    workdir: str = "orca_runs"
+
+
+@dataclass
 class Config:
     predictor: PredictorConfig = field(default_factory=PredictorConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     renderer: RendererConfig = field(default_factory=RendererConfig)
+    validator: ValidatorConfig = field(default_factory=ValidatorConfig)
 
 
 SECTIONS = {f.name: f.type for f in fields(Config)}
@@ -52,7 +67,8 @@ def _build(section_cls, parser, name):
         for key, raw in parser.items(name):
             if key not in known:
                 raise ValueError(f"[{name}] unknown key '{key}'; expected one of {sorted(known)}")
-            values[key] = known[key](raw)
+            # bool("false") is True, so booleans need the INI-aware parser.
+            values[key] = parser.getboolean(name, key) if known[key] is bool else known[key](raw)
     return section_cls(**values)
 
 
