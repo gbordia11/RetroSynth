@@ -12,20 +12,31 @@ propose a route, but only the tools can make it valid.
 While it runs, the CLI prints each step as it happens: Claude's thoughts, every tool call and its
 result, and the re-check of each reaction step. Pass --quiet to print only the result.
 
+Claude is reached in one of two ways, set by `backend` in [orchestrator]:
+- api (default): the Anthropic API through dspy, billed to ANTHROPIC_API_KEY.
+- claude_code: the local Claude Code CLI (`claude -p`), using its own login, for example a Claude
+  subscription. No API key is needed. Pass --claude-code to choose it for one run.
+
 Usage:
-    python orchestrator.py "[*]CC[*]" --stock stock.smi [--context TEXT] [--config config.ini] [--quiet]
+    python orchestrator.py "[*]CC[*]" --stock stock.smi [--context TEXT] [--config config.ini] [--quiet] [--claude-code]
 """
 
 import argparse
+import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import dspy
+from dspy.clients.engines.base import validate_request
+from dspy.lm15 import ConfigurationError, Message, ProviderError, Response, TextPart, Usage, response_to_events
+from dspy.lm15 import TimeoutError as LMTimeoutError
 from dspy.utils.callback import BaseCallback
 
 from config import DEFAULT_CONFIG_PATH, Config, load_config
@@ -76,6 +87,108 @@ class OrchestratorResult:
     issues: list = field(default_factory=list)  # why the route is not valid
     root: TreeNode | None = None  # the route as a tree, as the search agent would return it
     trajectory: dict = field(default_factory=dict)  # Claude's thoughts and tool calls
+
+
+class ClaudeCodeEngine:
+    """dspy engine that answers each request through the local Claude Code CLI instead of the Anthropic API.
+
+    It implements dspy's engine contract, complete(Request) -> Response, and is used as
+    dspy.LM(model, engine=ClaudeCodeEngine()). Each call runs `claude -p` once, with all of Claude
+    Code's own tools turned off, so Claude only answers the prompt; the orchestrator's tools still run
+    here, in dspy's ReAct loop. dspy's system message replaces Claude Code's system prompt, and the
+    conversation goes in on stdin.
+
+    ANTHROPIC_API_KEY is removed from the CLI's environment, so the CLI uses its own login (for
+    example a Claude subscription) rather than billing the API key.
+    """
+
+    def __init__(self, claude_path="claude", timeout=600):
+        self.claude_path = claude_path
+        self.timeout = timeout
+
+    def command(self, model, system):
+        return [
+            self.claude_path, "-p",
+            "--output-format", "json",
+            "--model", model.split("/", 1)[-1],  # the CLI takes names without dspy's provider prefix
+            "--tools", "",  # no Claude Code tools: Claude answers, the orchestrator's tools do the work
+            "--strict-mcp-config",  # and no MCP servers
+            "--no-session-persistence",
+            "--system-prompt", system,
+        ]
+
+    def complete(self, request):
+        validate_request(request)
+        system = request.system if isinstance(request.system, str) else "".join(p.text for p in request.system or ())
+        conversation = [(getattr(m.role, "value", m.role), m.text or "") for m in request.messages]
+        if len(conversation) == 1:
+            body = conversation[0][1]
+        else:  # few-shot demos or history: keep the turns labelled
+            body = "\n\n".join(f"{role}:\n{text}" for role, text in conversation)
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        try:
+            proc = subprocess.run(
+                self.command(request.model, system), input=body, capture_output=True, text=True,
+                timeout=self.timeout, env=env, cwd=tempfile.gettempdir(),  # away from the project's CLAUDE.md
+            )
+        except FileNotFoundError as exc:
+            raise ConfigurationError(f"Claude Code CLI not found at {self.claude_path!r}; install it or set claude_path") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise LMTimeoutError(f"Claude Code CLI timed out after {self.timeout} s", provider="claude_code") from exc
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            detail = (proc.stderr or proc.stdout).strip()[:500]
+            raise ProviderError(f"Claude Code CLI failed (exit {proc.returncode}): {detail}", provider="claude_code") from None
+        if data.get("is_error") or proc.returncode != 0:
+            raise ProviderError(f"Claude Code CLI returned an error: {str(data.get('result', data))[:500]}", provider="claude_code")
+        usage = data.get("usage") or {}
+        tokens_in, tokens_out = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+        return Response(
+            id=data.get("session_id"),
+            model=request.model,
+            message=Message.assistant([TextPart(data.get("result", ""))]),
+            finish_reason="stop",
+            usage=Usage(input_tokens=tokens_in, output_tokens=tokens_out, total_tokens=tokens_in + tokens_out),
+        )
+
+    def stream(self, request):
+        return response_to_events(self.complete(request))
+
+    def close(self):
+        pass
+
+    # Lets dspy save and reload a program that uses this engine.
+    def dump_state(self):
+        return {"claude_path": self.claude_path, "timeout": self.timeout}
+
+    @classmethod
+    def load_state(cls, state):
+        return cls(**state)
+
+
+def make_lm(config):
+    """The orchestrator's LM from its config: the Anthropic API (backend = api) or the Claude Code CLI."""
+    if config.backend == "api":
+        return dspy.LM(config.model, max_tokens=config.max_tokens)
+    if config.backend == "claude_code":
+        # One retry: a timed-out CLI call can be retried, but each attempt may take `timeout` seconds.
+        return dspy.LM(config.model, engine=ClaudeCodeEngine(config.claude_path, config.timeout), num_retries=1)
+    raise ValueError(f"unknown orchestrator backend {config.backend!r}; use 'api' or 'claude_code'")
+
+
+def as_steps(value):
+    """Claude's `steps` answer as a list of reaction SMILES. dspy normally parses it into a list, but
+    some dspy and Python versions hand back the raw text: a JSON list, or one reaction per line."""
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            value = [line.strip().lstrip("-*0123456789.) ").strip() for line in text.splitlines()]
+    if isinstance(value, str):
+        value = [value]
+    return [str(v).strip() for v in value if str(v).strip()]
 
 
 def parse_reaction(text):
@@ -170,7 +283,7 @@ class RetroOrchestrator(dspy.Module):
         self.stock = stock
         self.progress = progress
         self.validator = RouteValidator(self.config.validator)  # gate and energies; its LLM review is not used
-        self.lm = dspy.LM(self.config.orchestrator.model, max_tokens=self.config.orchestrator.max_tokens)
+        self.lm = make_lm(self.config.orchestrator)
         self.agent = dspy.ReAct(
             PlanSynthesis,
             tools=[self.validate_step, self.in_stock],
@@ -181,8 +294,7 @@ class RetroOrchestrator(dspy.Module):
         callbacks = [ProgressCallback(self.agent, self.progress)] if self.progress else []
         with dspy.context(lm=self.lm, callbacks=callbacks):
             pred = self.agent(target=target, context=context)
-        steps = pred.steps if isinstance(pred.steps, list) else str(pred.steps).splitlines()
-        result = self.check(target, [s for s in steps if s.strip()])
+        result = self.check(target, as_steps(pred.steps))
         result.rationale = pred.rationale
         result.trajectory = dict(pred.trajectory)
         return result
@@ -281,7 +393,8 @@ class ProgressPrinter:
     def header(self, target, config):
         criteria = ", ".join(c.strip() for c in config.validator.criterion.split(","))
         self._print(self._style(f"Target  {target}", "1"))
-        self._print(f"Claude  {config.orchestrator.model}  |  energies  {config.validator.backend} ({criteria})"
+        via = " via Claude Code" if config.orchestrator.backend == "claude_code" else ""
+        self._print(f"Claude  {config.orchestrator.model}{via}  |  energies  {config.validator.backend} ({criteria})"
                     f"  |  up to {config.orchestrator.max_iters} tool calls")
 
     def __call__(self, event, data):
@@ -338,9 +451,13 @@ def main():
     parser.add_argument("--context", default="", help="extra instructions for Claude")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="settings file (INI)")
     parser.add_argument("--quiet", action="store_true", help="print only the result, not each step as it happens")
+    parser.add_argument("--claude-code", action="store_true",
+                        help="reach Claude through the local Claude Code CLI (its own login) instead of the API")
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.claude_code:
+        config = replace(config, orchestrator=replace(config.orchestrator, backend="claude_code"))
     stock = load_stock(args.stock)
     printer = None if args.quiet else ProgressPrinter()
     if printer:

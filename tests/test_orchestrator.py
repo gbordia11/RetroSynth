@@ -31,6 +31,24 @@ def test_parse_reaction_rejects_unreadable_steps(text):
         parse_reaction(text)
 
 
+@pytest.mark.parametrize("value", [
+    ["C=C>>[*]CC[*]"],
+    '["C=C>>[*]CC[*]"]',          # a JSON list left as text
+    "C=C>>[*]CC[*]",              # one reaction
+    "1. C=C>>[*]CC[*]\n",         # a numbered line
+])
+def test_steps_answer_is_read_as_a_list(value):
+    from orchestrator import as_steps
+
+    assert as_steps(value) == ["C=C>>[*]CC[*]"]
+
+
+def test_multiline_steps_answer_keeps_every_step():
+    from orchestrator import as_steps
+
+    assert as_steps("- C=C.O>>CCO\n- CCO>>C=C") == ["C=C.O>>CCO", "CCO>>C=C"]
+
+
 def test_route_from_steps_links_intermediates():
     root, issues = route_from_steps(["C=C.O>>CCO", "CCO>>C=C"], "C=C")
     assert issues == []

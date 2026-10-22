@@ -223,7 +223,15 @@ When a step fails, Claude revises it and validates again. It returns the path as
 python orchestrator.py "[*]CC[*]" --stock stock.smi
 ```
 
-This needs `ANTHROPIC_API_KEY` in `.env`. While it runs, the CLI shows each step as it happens:
+This needs `ANTHROPIC_API_KEY` in `.env`. To use your local Claude Code login (for example a Claude subscription) instead of an API key, add `--claude-code`:
+
+```bash
+python orchestrator.py "[*]CC[*]" --stock stock.smi --claude-code
+```
+
+Each request then runs `claude -p` once, with Claude Code's own tools and MCP servers turned off, so Claude only answers; the orchestrator's tools still run in this process. `ANTHROPIC_API_KEY` is removed from the CLI's environment so the CLI uses its login, not the key. Each call adds about 5 s of CLI start-up time. The backend is a dspy engine (`ClaudeCodeEngine`, passed as `dspy.LM(engine=...)`), so dspy caches answers as it does for the API: an identical request is answered from the cache without running the CLI. Set `backend = claude_code` in `[orchestrator]` to make it the default, and `claude_path` if `claude` is not on your `PATH`.
+
+While it runs, the CLI shows each step as it happens:
 
 ```
 Target  [*]CC[*]
@@ -269,7 +277,7 @@ python demo_offline.py 2      # one scenario
 
 The demo shows the tools and the safety rule working, not Claude's chemistry. For that, run `orchestrator.py` with an API key.
 
-Settings are in `[orchestrator]`: `model`, `max_tokens`, `max_iters` (tool calls before Claude must answer). The energy backend and criteria come from `[validator]`; its `enabled` flag does not matter here.
+Settings are in `[orchestrator]`: `model`, `max_tokens`, `max_iters` (tool calls before Claude must answer), `backend` (`api` or `claude_code`), `claude_path` and `timeout` (seconds per CLI call). The energy backend and criteria come from `[validator]`; its `enabled` flag does not matter here.
 
 ## 4. Use several agents together
 
@@ -317,7 +325,7 @@ Each agent has its own section in `config.ini`:
 | `[search]` | `max_depth`, `beam`, `max_routes` | agent 2 |
 | `[renderer]` | `out_dir`, `width`, `height` | agent 4 |
 | `[validator]` | `enabled`, `backend`, `criterion`, `model`, `max_tokens`, `max_iters`, `orca_path`, `method`, `timeout`, `workdir` | agent 5 |
-| `[orchestrator]` | `model`, `max_tokens`, `max_iters` | Claude orchestrator (`orchestrator.py`) |
+| `[orchestrator]` | `model`, `max_tokens`, `max_iters`, `backend`, `claude_path`, `timeout` | Claude orchestrator (`orchestrator.py`) |
 
 Notes:
 

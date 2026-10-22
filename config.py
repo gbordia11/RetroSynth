@@ -61,9 +61,12 @@ class OrchestratorConfig:
     """Claude orchestrator: proposes monomers and steps, and checks them with the validator's tools.
     Energies use the [validator] backend and criterion."""
 
-    model: str = "anthropic/claude-sonnet-5-5"  # reads ANTHROPIC_API_KEY from .env
-    max_tokens: int = 8000
+    model: str = "anthropic/claude-sonnet-5-5"  # reads ANTHROPIC_API_KEY from .env when backend = api
+    max_tokens: int = 8000  # used by backend = api
     max_iters: int = 20  # tool calls before the agent must answer
+    backend: str = "api"  # "api" (Anthropic API) or "claude_code" (local `claude -p`, its own login)
+    claude_path: str = "claude"  # Claude Code CLI on PATH, or its full path; backend = claude_code
+    timeout: int = 600  # seconds per Claude Code CLI call; backend = claude_code
 
 
 @dataclass
