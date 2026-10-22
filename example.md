@@ -256,6 +256,19 @@ for s in result.steps:                 # forward order, starting materials first
 print(result.rationale)
 ```
 
+To see the orchestrator work without an API key, run the offline demo. Claude's side is scripted, but the gate, the GFN2-xTB energies, the stock check, the live display and the re-check are real:
+
+```bash
+python demo_offline.py        # all three scenarios, a few seconds
+python demo_offline.py 2      # one scenario
+```
+
+1. Polyethylene: a correct proposal passes.
+2. Polyacrylonitrile: ethylene fails the gate (no nitrogen), Claude revises to acrylonitrile, and that passes.
+3. Polyacrylonitrile: Claude skips the tools and claims ethylene works. The re-check rejects the route.
+
+The demo shows the tools and the safety rule working, not Claude's chemistry. For that, run `orchestrator.py` with an API key.
+
 Settings are in `[orchestrator]`: `model`, `max_tokens`, `max_iters` (tool calls before Claude must answer). The energy backend and criteria come from `[validator]`; its `enabled` flag does not matter here.
 
 ## 4. Use several agents together
