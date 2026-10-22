@@ -12,6 +12,8 @@ The pipeline has five agents:
 | 4 | `renderer.py` | `RouteRenderer`: draws each route as a PNG | no |
 | 5 | `validator.py` | `RouteValidator`: checks each reaction step (gate, then GFN2-xTB ΔG < 0 and ΔH < 0), then an LLM review | yes (for the review only; the energy check runs without it) |
 
+`orchestrator.py` is an alternative to agents 1–2: Claude itself proposes monomers and reaction steps, checks each step with agent 5's gate and energies, and revises the ones that fail. It reaches Claude through the Anthropic API or the local Claude Code CLI. See [Claude orchestrator](#claude-orchestrator).
+
 ## 1. Setup
 
 Run everything from the project folder.
@@ -19,19 +21,25 @@ Run everything from the project folder.
 ```bash
 conda create -n retrosynth -c conda-forge python=3.11 rdkit numpy scipy pillow tblite-python pytest
 conda activate retrosynth
-pip install dspy python-dotenv
+pip install "dspy==3.4.1" python-dotenv
 ```
+
+Install dspy with pip only. Installing it with conda as well (`conda install conda-forge::dspy`) puts an older dspy's files over the pip install while `pip show dspy` still reports 3.4.1. Typed answers then come back as plain text, so the predictor's lists break. To repair: `conda remove --force dspy`, `pip uninstall dspy`, then `pip install "dspy==3.4.1"`.
+
+To use the orchestrator's `--claude-code` option, install the Claude Code CLI and log in once by running `claude`. Check that `claude -p "Reply with OK"` prints `OK`.
 
 API keys go in a `.env` file in the project folder. The file is read automatically, and git ignores it:
 
 ```
 MISTRAL_API_KEY=your-key-here           # used by agent 5 (validator)
-ANTHROPIC_API_KEY=your-key-here         # used by agent 1 (predictor), if you keep the default model
+ANTHROPIC_API_KEY=your-key-here         # used by agent 1 (predictor) and the orchestrator (backend = api), with the default models
 ```
+
+The orchestrator with `--claude-code` (`backend = claude_code`) needs no API key: it uses the Claude Code CLI's own login.
 
 A variable already set in your shell takes precedence over `.env`.
 
-You need a building-block file: one SMILES per line, optionally followed by a name. The project includes one as `stock.smi`:
+You need a building-block file: one SMILES per line, optionally followed by a name. The project does not include one; create `stock.smi` in the project folder, for example:
 
 ```
 smiles name
@@ -332,9 +340,12 @@ Notes:
 - `model` takes any dspy model string, such as `anthropic/claude-sonnet-5-5` or `openai/gpt-4o`. Set a different model per agent.
 - Unknown sections or keys are errors. A typo such as `modle` stops the run, with a message naming the key.
 - `enabled` takes `true` or `false`.
-- `backend` is `gfn2` (default, GFN2-xTB through `tblite`, no external binary) or `orca`.
+- `backend` means different things in two sections:
+  - in `[validator]`, the energy source: `gfn2` (default, GFN2-xTB through `tblite`, no external binary) or `orca`;
+  - in `[orchestrator]`, how Claude is reached: `api` (default, the Anthropic API with `ANTHROPIC_API_KEY`) or `claude_code` (the local `claude -p` CLI with its own login). `--claude-code` on the command line selects `claude_code` for one run.
 - `criterion` is a comma-separated list; every listed change must be below zero. `dg` (free energy) and `dh` (enthalpy) need `gfn2`; `de` (electronic energy) works with either backend. Default `dg, dh`. A condensation step with a small or positive ΔH that is driven by entropy fails `dh`; drop it if you want to accept those.
 - `orca_path` is the ORCA binary name on your `PATH`, or its full path, for example `/opt/orca/orca`. It is used only when `backend = orca`.
+- `claude_path` is the Claude Code CLI on your `PATH`, or its full path. `timeout` in `[orchestrator]` is the limit in seconds for each CLI call; `timeout` in `[validator]` is the limit for each ORCA run. Both are used only by their own backend (`claude_code`, `orca`).
 - `method` is the ORCA keyword line. The default `B3LYP D3BJ def2-SVP Opt TightSCF` runs a geometry optimisation first, then a single point.
 - Agents 2, 3, and 4 have no model. Agent 2 uses the predictor's model, and agents 3 and 4 use no LLM.
 
@@ -347,8 +358,14 @@ Notes:
 | `403` "not available in your subscription tier" | The model needs a higher Mistral tier. Use `mistral/open-mistral-nemo`, or change `model` in `[validator]`. |
 | `429 Too Many Requests` | The provider rate-limits you. Wait and retry, or use a smaller `k`/`max_iters`. |
 | `ORCA not found at 'orca'` | Set `orca_path` in `[validator]` to the full path of the binary, or use `backend = gfn2`. |
-| `tblite` import error | Run `pip install tblite`. |
+| `tblite` import error | Run `conda install -c conda-forge tblite-python` in the environment. |
 | `has an imaginary mode` | The relaxed structure is a saddle point, not a minimum. Relax it further or rebuild it from a different conformer. |
 | `ORCA did not terminate normally` | Open the `.out` file in `orca_runs/` (or your `workdir`) and read the ORCA error. |
 | `config file not found` | Run from the project folder, or pass `--config` with the path. |
 | `unknown key` / `unknown config section` | Check the spelling against the table in section 6. |
+| `credit balance is too low to access the Anthropic API` | The API account behind `ANTHROPIC_API_KEY` has no credits. Add credits, or run the orchestrator with `--claude-code` to use your Claude Code login. |
+| `Claude Code CLI not found at 'claude'` | Install Claude Code, or set `claude_path` in `[orchestrator]` to the full path of the `claude` binary. |
+| `Claude Code CLI returned an error: ... Not logged in` (or another login message) | Run `claude` once in a terminal and log in, then check `claude -p "Reply with OK"`. |
+| `Claude Code CLI timed out after ... s` | Raise `timeout` in `[orchestrator]`. Each call is retried once, so a stuck call can take up to twice the timeout. |
+| `Claude Code CLI failed (exit ...)` | The message shows the CLI's own error. An "unknown option" message means the installed Claude Code is too old for the flags used; update it. |
+| Predictor or orchestrator answers arrive as text, not lists, or `zip` errors in the predictor | dspy is a mixed install. See the dspy note in [section 1](#1-setup). |
