@@ -1,6 +1,6 @@
 from agent import RetroSynth, format_route
 from config import Config, PredictorConfig, RendererConfig, SearchConfig
-from molecules import TreeNode, canonical, element_counts, load_stock, route_score
+from molecules import TreeNode, canonical, element_counts, end_points, load_stock, route_score
 from predictor import SingleStepPredictor
 from ranker import RouteRanker
 from renderer import RouteRenderer
@@ -31,6 +31,12 @@ def test_load_stock_reads_first_field_and_skips_header(tmp_path):
 
 def test_element_counts_counts_heavy_atoms():
     assert element_counts(ACETIC_ACID) == {"C": 2, "O": 2}
+
+
+def test_end_points_are_counted_and_not_treated_as_elements():
+    ru = canonical("[*]CC[*]")
+    assert end_points(ru) == 2 and end_points("CC") == 0
+    assert element_counts(ru) == {"C": 2}
 
 
 def test_route_score_is_product_of_step_probabilities():
@@ -153,6 +159,32 @@ def test_pipeline_end_to_end(stock, aspirin_table, tmp_path):
     assert all(r.valid for r in result.routes)
     assert len(result.images) == 2
     assert all(p.exists() for p in result.images)
+
+
+def test_polymer_route_is_valid_through_the_pipeline(tmp_path):
+    """A [*] target is canonicalised to bare *; the ranker and validator must still accept it."""
+    import dspy
+
+    from config import ValidatorConfig
+
+    pe = "[*]CC[*]"
+    config = Config(
+        renderer=RendererConfig(out_dir=str(tmp_path)),
+        validator=ValidatorConfig(enabled=True, backend="orca", criterion="de", orca_path="no-such-orca-binary"),
+    )
+    backend = {canonical(pe): [(["C=C"], 0.9)]}
+    pipeline = RetroSynth({canonical("C=C")}, config, backend=lambda s: backend.get(s, []))
+    fake = {canonical("CC"): -79.17, canonical("[H][H]"): -1.17, canonical("C=C"): -77.97}  # E(RU) = -78.00, so dE < 0
+    pipeline.validator.energies.energy = lambda smi: fake[canonical(smi)]
+    pipeline.validator.lm = dspy.utils.DummyLM([
+        {"next_thought": "Exothermic addition polymerisation.", "next_tool_name": "finish", "next_tool_args": {}},
+        {"reasoning": "Balanced, dE < 0.", "valid": True, "rationale": "Ethylene polymerisation."},
+    ])
+    result = pipeline("", pe)
+    assert [r.valid for r in result.routes] == [True]
+    step = result.validations[0].steps[0]
+    assert step.gate_ok and step.deltas["dE"] < 0
+    assert result.validations[0].valid
 
 
 def test_pipeline_reports_no_route(stock, tmp_path):

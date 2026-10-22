@@ -10,14 +10,16 @@ The pipeline has five agents:
 | 2 | `search.py` | `RetroSearchAgent`: expands the tree until every leaf is in stock | only through agent 1 |
 | 3 | `ranker.py` | `RouteRanker`: validates and ranks routes | no |
 | 4 | `renderer.py` | `RouteRenderer`: draws each route as a PNG | no |
-| 5 | `validator.py` | `RouteValidator`: checks each reaction step (gate, then GFN2-xTB ΔE < 0), then an LLM review | yes (for the review only; the energy check runs without it) |
+| 5 | `validator.py` | `RouteValidator`: checks each reaction step (gate, then GFN2-xTB ΔG < 0 and ΔH < 0), then an LLM review | yes (for the review only; the energy check runs without it) |
 
 ## 1. Setup
 
 Run everything from the project folder.
 
 ```bash
-pip install rdkit dspy pillow pytest
+conda create -n retrosynth -c conda-forge python=3.11 rdkit numpy scipy pillow tblite-python pytest
+conda activate retrosynth
+pip install dspy python-dotenv
 ```
 
 API keys go in a `.env` file in the project folder. The file is read automatically, and git ignores it:
@@ -177,7 +179,7 @@ result = validator(routes[0])          # routes from agent 2
 print(result.valid)
 print(result.rationale)
 for s in result.steps:
-    print(" + ".join(s.reactants), "->", s.product, s.gate_ok, s.delta_e)
+    print(" + ".join(s.reactants), "->", s.product, s.gate_ok, s.deltas, s.ceiling_temperature)
 ```
 
 The validator runs in two stages:
@@ -195,18 +197,45 @@ The validator runs in two stages:
    print(result.valid, result.rationale)    # False, rejected by the chemistry gate: ...
    ```
 
-2. **Thermodynamic check (GFN2-xTB).** Each molecule in a step is built in 3D with RDKit and relaxed with GFN2-xTB through the `tblite` library. The default criterion is the free-energy change ΔG at 298 K and 1 atm, kcal/mol. G is the electronic energy plus a thermal correction from a numerical Hessian (harmonic vibrations, rigid rotor, ideal gas). The route passes only if every step has ΔG < 0. A step without a value fails. A molecule with an imaginary mode is reported as not a minimum, and the step fails. Set `criterion = de` to check the electronic energy ΔE instead. Set `backend = orca` to use ORCA, which supports ΔE only.
+2. **Thermodynamic check (GFN2-xTB).** Each molecule in a step is built in 3D with RDKit and relaxed with GFN2-xTB through the `tblite` library. The default criteria are the free-energy change ΔG and the enthalpy change ΔH at 298 K and 1 atm, in kcal/mol. H and G are the electronic energy plus thermal corrections from one numerical Hessian per molecule (harmonic vibrations, rigid rotor, ideal gas). The route passes only if every step has every configured change below zero. A step without a value fails. A molecule with an imaginary mode is reported as not a minimum, and the step fails. When both ΔG and ΔH are computed and ΔH, ΔS < 0, each step also reports its ceiling temperature Tc = ΔH/ΔS, above which ΔG turns positive. `criterion` takes a comma-separated list of `dg`, `dh` and `de`. Set `backend = orca` to use ORCA, which supports `de` only.
 
 3. **LLM review.** This runs only if the route passed stages 1 and 2. A ReAct agent reads the whole path, one line per step in forward order, and can call these tools in whatever order it chooses. It can reject a route, but it cannot approve one that failed the energy check:
    - `check_step(product, reactants)`: runs the gate on one step
    - `molecule_energy(smiles)`: relaxed electronic energy of one molecule, in Hartree, from the configured backend
-   - `step_energy(product, reactants)`: ΔE of one step, in kcal/mol
+   - `step_energy(product, reactants)`: the configured changes (ΔG, ΔH or ΔE) of one step, in kcal/mol
 
    This stage needs `MISTRAL_API_KEY` in `.env`. The default model is `mistral/open-mistral-nemo`.
 
 To set the ORCA binary for `backend = orca`, see [section 6](#6-settings-per-agent).
 
-**Caveat:** ΔG is a gas-phase estimate from one GFN2-xTB geometry relaxation with a rigid-rotor, harmonic-oscillator correction. It ignores solvent, conformer sampling, and anharmonicity. The rotational symmetry number is taken as 1, which shifts entropy by up to about 0.6 kcal/mol for symmetric molecules. GFN2 magnitudes differ from experiment: for ethylene + H₂ → ethane, GFN2 gives ΔG ≈ −35 kcal/mol, against an experimental value near −24. Use it as a screen, not as a feasibility cutoff.
+**Caveat:** ΔG is a gas-phase estimate from one GFN2-xTB geometry relaxation with a rigid-rotor, harmonic-oscillator correction. It ignores solvent, conformer sampling, and anharmonicity. The rotational symmetry number is taken as 1, which shifts entropy by up to about 0.6 kcal/mol for symmetric molecules. GFN2 magnitudes differ from experiment: for ethylene + H₂ → ethane, GFN2 gives ΔG ≈ −35 kcal/mol, against an experimental value near −24. Use it as a screen, not as a feasibility cutoff. For a polymer step, the repeat unit is modelled as the H-capped unit minus H₂, so ethylene → polyethylene comes out equal to the hydrogenation of ethylene (GFN2: ΔH ≈ −44 kcal/mol, against an experimental polymerisation enthalpy near −22). Treat polymer ΔH and ceiling temperatures as qualitative.
+
+### Claude orchestrator
+
+`orchestrator.py` puts Claude in charge instead of the fixed search. Claude reads the target, proposes monomers and a forward reaction path, and calls two tools while it works:
+
+- `validate_step(product, reactants)`: the agent 5 chemistry gate, then the energy changes from `[validator]` (ΔG and ΔH with GFN2-xTB by default), with PASS or FAIL and the ceiling temperature
+- `in_stock(smiles)`: whether starting materials are in the stock file
+
+When a step fails, Claude revises it and validates again. It returns the path as reaction SMILES, for example `C=C>>[*]CC[*]`. The returned path is then re-checked without the LLM: every step must pass the gate and every configured energy criterion, and every starting material must be in stock. Claude cannot mark a route valid on its own.
+
+```bash
+python orchestrator.py "[*]CC[*]" --stock stock.smi
+```
+
+This needs `ANTHROPIC_API_KEY` in `.env`. The output lists Claude's tool calls, each validated step with its energies, any issues, Claude's rationale, and a PNG of the route. From Python:
+
+```python
+from orchestrator import RetroOrchestrator
+
+result = RetroOrchestrator(stock, config)("[*]CC[*]", context="prefer step-growth routes")
+print(result.valid, result.issues)
+for s in result.steps:                 # forward order, starting materials first
+    print(" + ".join(s.reactants), "->", s.product, s.deltas, s.ceiling_temperature)
+print(result.rationale)
+```
+
+Settings are in `[orchestrator]`: `model`, `max_tokens`, `max_iters` (tool calls before Claude must answer). The energy backend and criteria come from `[validator]`; its `enabled` flag does not matter here.
 
 ## 4. Use several agents together
 
@@ -254,6 +283,7 @@ Each agent has its own section in `config.ini`:
 | `[search]` | `max_depth`, `beam`, `max_routes` | agent 2 |
 | `[renderer]` | `out_dir`, `width`, `height` | agent 4 |
 | `[validator]` | `enabled`, `backend`, `criterion`, `model`, `max_tokens`, `max_iters`, `orca_path`, `method`, `timeout`, `workdir` | agent 5 |
+| `[orchestrator]` | `model`, `max_tokens`, `max_iters` | Claude orchestrator (`orchestrator.py`) |
 
 Notes:
 
@@ -261,7 +291,7 @@ Notes:
 - Unknown sections or keys are errors. A typo such as `modle` stops the run, with a message naming the key.
 - `enabled` takes `true` or `false`.
 - `backend` is `gfn2` (default, GFN2-xTB through `tblite`, no external binary) or `orca`.
-- `criterion` is `dg` (default, free-energy change, needs `gfn2`) or `de` (electronic-energy change).
+- `criterion` is a comma-separated list; every listed change must be below zero. `dg` (free energy) and `dh` (enthalpy) need `gfn2`; `de` (electronic energy) works with either backend. Default `dg, dh`. A condensation step with a small or positive ΔH that is driven by entropy fails `dh`; drop it if you want to accept those.
 - `orca_path` is the ORCA binary name on your `PATH`, or its full path, for example `/opt/orca/orca`. It is used only when `backend = orca`.
 - `method` is the ORCA keyword line. The default `B3LYP D3BJ def2-SVP Opt TightSCF` runs a geometry optimisation first, then a single point.
 - Agents 2, 3, and 4 have no model. Agent 2 uses the predictor's model, and agents 3 and 4 use no LLM.

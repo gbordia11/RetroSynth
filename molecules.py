@@ -28,9 +28,14 @@ def load_stock(path):
     return stock
 
 
+def end_points(smiles):
+    """Number of [*] end points. canonical() writes them as a bare *, so count atoms, not text."""
+    return sum(1 for atom in Chem.MolFromSmiles(smiles).GetAtoms() if atom.GetAtomicNum() == 0)
+
+
 def element_counts(smiles):
-    """Count heavy atoms by element."""
-    return Counter(atom.GetSymbol() for atom in Chem.MolFromSmiles(smiles).GetAtoms())
+    """Count heavy atoms by element. [*] end points are not atoms and are not counted."""
+    return Counter(atom.GetSymbol() for atom in Chem.MolFromSmiles(smiles).GetAtoms() if atom.GetAtomicNum() > 0)
 
 
 @dataclass

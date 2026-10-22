@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from thermo import inertia_eigenvalues, is_linear, rrho_thermo
+from thermo import T_STD, inertia_eigenvalues, is_linear, rrho_thermo
 
 # H2 at its experimental bond length, with its harmonic stretch frequency.
 H2_BOND_BOHR = 0.7414 / 0.52917721092
@@ -25,6 +25,11 @@ def test_h2_zero_point_energy_is_harmonic_value():
 def test_gibbs_correction_combines_enthalpy_and_entropy():
     thermo = rrho_thermo(H2_POSITIONS, H2_MASSES, H2_NU, sigma=2)
     assert thermo.g_corr < thermo.zpe  # the TS term outweighs the thermal enthalpy for H2
+
+
+def test_enthalpy_correction_is_gibbs_correction_plus_ts():
+    thermo = rrho_thermo(H2_POSITIONS, H2_MASSES, H2_NU, sigma=2)
+    assert thermo.h_corr == pytest.approx(thermo.g_corr + T_STD * thermo.entropy)
 
 
 def test_h2_is_linear_and_nonlinear_water_is_not():

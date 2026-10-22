@@ -32,6 +32,7 @@ NOISE_CM = 10.0  # modes between this and zero are numerical noise and are ignor
 class Thermo:
     zpe: float  # zero-point energy, J/mol
     entropy: float  # S, J/(mol K)
+    h_corr: float  # H_corr, J/mol (the enthalpy term inside G_corr)
     g_corr: float  # G_corr = H_corr - T*S, J/mol
     n_imaginary: int
 
@@ -101,4 +102,4 @@ def rrho_thermo(positions, masses, frequencies, sigma=1, T=T_STD, P=P_STD):
 
     h_corr = zpe + h_vib + h_trans + h_rot + R * T  # RT is the PV term of an ideal gas
     entropy = s_trans + s_rot + s_vib
-    return Thermo(zpe=zpe, entropy=entropy, g_corr=h_corr - T * entropy, n_imaginary=n_imaginary)
+    return Thermo(zpe=zpe, entropy=entropy, h_corr=h_corr, g_corr=h_corr - T * entropy, n_imaginary=n_imaginary)

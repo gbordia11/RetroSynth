@@ -7,7 +7,7 @@ Two modes:
 
 2. A row from a polymerization dataset (--csv FILE --pid PID). The reaction is
    reactant1 + reactant2 -> Polymer_smiles, with the by-product found by atom balance.
-   The script reports the gate, ΔG per repeat unit and the validator verdict. Barrier and
+   The script reports the gate, ΔG and ΔH per repeat unit and the validator verdict. Barrier and
    regioselectivity are not computed: for symmetric step-growth monomers every reacting group
    is equivalent, so there is no site choice to compare.
 
@@ -18,12 +18,12 @@ Usage:
 """
 
 import argparse
-import csv
 
 from config import load_config
+from dataset import find_row, row_reactants
 from kinetics import boltzmann_fractions, combined_geometry, hydrogen_on, scan_barrier
 from molecules import TreeNode, canonical
-from validator import RouteValidator
+from validator import RouteValidator, format_deltas
 
 REACTANTS = "C=CC.Cl"  # propene + HCl
 DONOR = "Cl"  # the element that carries the transferred proton (HCl)
@@ -51,10 +51,10 @@ def evaluate(reactants, candidates, donor, config, use_llm=True):
         if use_llm:
             verdict = validator(route)
             step = verdict.steps[0]
-            dg, valid = step.delta, verdict.valid
+            dg, valid = step.deltas.get("dG"), verdict.valid
         else:
             step_reactants = {s: reactant_smiles.count(s) for s in set(reactant_smiles)}
-            dg = validator.step_delta(product, step_reactants)
+            dg = validator.step_delta_g(product, step_reactants)
             valid = dg < 0
 
         scan = scan_barrier(validator.energies, reactants, pair)
@@ -74,8 +74,8 @@ def evaluate(reactants, candidates, donor, config, use_llm=True):
     return results
 
 
-def print_table(results, criterion):
-    print(f"{'candidate':<32}{'product':<14}{'dG' if criterion == 'dg' else 'dE':>10}{'Ea':>10}"
+def print_table(results):
+    print(f"{'candidate':<32}{'product':<14}{'dG':>10}{'Ea':>10}"
           f"{'TS (A)':>9}{'ratio':>9}  valid")
     for r in results:
         note = " *" if r["at_end"] else ""
@@ -87,17 +87,10 @@ def print_table(results, criterion):
 
 
 def route_from_row(row):
-    """Route tree for one dataset row: the product is Polymer_smiles (PSMILES), the reactants are reactant1 and reactant2."""
-    reactants = [canonical(row["reactant1"]), canonical(row["reactant2"])]
-    return TreeNode(canonical(row["Polymer_smiles"]), 1.0, [TreeNode(s) for s in reactants])
-
-
-def find_row(path, pid):
-    with open(path, newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            if row["PID"] == pid:
-                return row
-    raise SystemExit(f"PID {pid} not found in {path}")
+    """Route tree for one dataset row: the product is Polymer_smiles (PSMILES), the reactants are the
+    monomers of one repeat unit (a homopolymer's monomer once)."""
+    counts = row_reactants(row)
+    return TreeNode(canonical(row["Polymer_smiles"]), 1.0, [TreeNode(s) for s in counts for _ in range(counts[s])])
 
 
 def report_row(row, config, use_llm):
@@ -109,16 +102,14 @@ def report_row(row, config, use_llm):
         verdict = validator(route)
         step = verdict.steps[0]
         print(f"  gate: {'ok' if step.gate_ok else 'FAIL'} ({step.message})")
-        print(f"  dG = {step.delta:.2f} kcal/mol per repeat unit" if step.delta is not None
-              else f"  dG not computed: {step.note}")
+        print(f"  {format_deltas(step.deltas)} per repeat unit" if step.deltas
+              else f"  energies not computed: {step.note}")
         print(f"  validator: valid={verdict.valid}")
         print(f"  {verdict.rationale}")
     else:
-        step_reactants = {}
-        for node in route.children:
-            step_reactants[node.smiles] = step_reactants.get(node.smiles, 0) + 1
-        dg = validator.step_delta(route.smiles, step_reactants)
-        print(f"  dG = {dg:.2f} kcal/mol per repeat unit ({'favourable' if dg < 0 else 'not favourable'})")
+        deltas = validator.step_deltas(route.smiles, row_reactants(row))
+        favourable = all(v < 0 for v in deltas.values())
+        print(f"  {format_deltas(deltas)} per repeat unit ({'favourable' if favourable else 'not favourable'})")
     print("  barrier and regioselectivity: not computed for this step-growth reaction (see module docstring)")
 
 
@@ -130,16 +121,20 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
-    if config.validator.backend != "gfn2" or config.validator.criterion != "dg":
-        raise SystemExit("this example needs backend = gfn2 and criterion = dg in [validator]")
+    if config.validator.backend != "gfn2":
+        raise SystemExit("this example needs backend = gfn2 in [validator]")
 
     if args.csv:
         if not args.pid:
             raise SystemExit("--csv needs --pid")
-        report_row(find_row(args.csv, args.pid), config, use_llm=not args.no_llm)
+        try:
+            row = find_row(args.csv, args.pid)
+        except KeyError as exc:
+            raise SystemExit(str(exc))
+        report_row(row, config, use_llm=not args.no_llm)
         return
     results = evaluate(REACTANTS, CANDIDATES, DONOR, config, use_llm=not args.no_llm)
-    print_table(results, config.validator.criterion)
+    print_table(results)
 
 
 if __name__ == "__main__":

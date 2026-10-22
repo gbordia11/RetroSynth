@@ -3,8 +3,8 @@
 For each molecule: RDKit embeds a 3D geometry, GFN2-xTB relaxes it with L-BFGS, and the
 electronic energy of the relaxed structure is returned in Hartree.
 
-The free energy adds the thermal correction from a numerical Hessian (finite differences of
-the GFN2 gradient) and rigid-rotor, harmonic-oscillator thermochemistry at 298.15 K.
+The enthalpy and free energy add the thermal corrections from a numerical Hessian (finite
+differences of the GFN2 gradient) and rigid-rotor, harmonic-oscillator thermochemistry at 298.15 K.
 """
 
 import numpy as np
@@ -31,11 +31,11 @@ class Gfn2Error(RuntimeError):
 
 
 class Gfn2Runner:
-    """Relaxes molecules at GFN2-xTB and returns their electronic energies and free energies."""
+    """Relaxes molecules at GFN2-xTB and returns their electronic energies, enthalpies and free energies."""
 
     def __init__(self):
         self._relaxed = {}
-        self._free = {}
+        self._thermo = {}
 
     @staticmethod
     def available():
@@ -113,12 +113,12 @@ class Gfn2Runner:
             hess[:, i] = (gradient(plus) - gradient(minus)) / (2 * HESSIAN_STEP)
         return (hess + hess.T) / 2
 
-    def free_energy(self, smiles):
-        """Free energy G (Hartree) at 298.15 K and 1 atm: electronic energy plus thermal correction.
+    def thermochemistry(self, smiles):
+        """(electronic energy in Hartree, Thermo) of the relaxed structure. One Hessian per molecule, cached.
         Raises Gfn2Error if the structure has an imaginary mode, because it is not a minimum."""
         key = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
-        if key in self._free:
-            return self._free[key]
+        if key in self._thermo:
+            return self._thermo[key]
         numbers, positions, charge, unpaired, energy = self.relax(key)
         masses = np.array([Chem.GetPeriodicTable().GetAtomicWeight(int(z)) for z in numbers])
         hess = self.hessian(numbers, positions, charge, unpaired)
@@ -130,5 +130,15 @@ class Gfn2Runner:
             raise Gfn2Error(
                 f"{key} has an imaginary mode below {IMAGINARY_CM:.0f} cm^-1; the structure is not a minimum"
             )
-        self._free[key] = energy + thermo.g_corr / (NA * HARTREE_J)
-        return self._free[key]
+        self._thermo[key] = (energy, thermo)
+        return self._thermo[key]
+
+    def free_energy(self, smiles):
+        """Free energy G (Hartree) at 298.15 K and 1 atm: electronic energy plus thermal correction."""
+        energy, thermo = self.thermochemistry(smiles)
+        return energy + thermo.g_corr / (NA * HARTREE_J)
+
+    def enthalpy(self, smiles):
+        """Enthalpy H (Hartree) at 298.15 K: electronic energy plus ZPE, thermal energy and PV."""
+        energy, thermo = self.thermochemistry(smiles)
+        return energy + thermo.h_corr / (NA * HARTREE_J)
