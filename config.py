@@ -4,7 +4,13 @@ import configparser
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.ini"
+from dotenv import load_dotenv
+
+PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = PROJECT_DIR / "config.ini"
+
+# API keys (e.g. MISTRAL_API_KEY) come from .env. Variables already set in the shell win.
+load_dotenv(PROJECT_DIR / ".env", override=False)
 
 
 @dataclass
@@ -38,11 +44,13 @@ class RendererConfig:
 class ValidatorConfig:
     """Agent 5: route validator. An LLM calls tools (repeat-unit check, mass balance, ORCA)."""
 
-    enabled: bool = False  # runs only for polymer targets ([*] end points) when True
-    model: str = "anthropic/claude-sonnet-5-5"
+    enabled: bool = False  # runs the thermodynamic check on every route when True
+    backend: str = "gfn2"  # energy source: "gfn2" (GFN2-xTB via tblite) or "orca"
+    criterion: str = "dg"  # step must have dG < 0 ("dg", needs gfn2) or dE < 0 ("de")
+    model: str = "mistral/open-mistral-nemo"  # reads MISTRAL_API_KEY from .env
     max_tokens: int = 4000
     max_iters: int = 6  # tool-calling steps before the agent must answer
-    orca_path: str = "orca"  # binary name on PATH, or full path
+    orca_path: str = "orca"  # binary name on PATH, or full path, used only when backend = orca
     method: str = "B3LYP D3BJ def2-SVP Opt TightSCF"  # ORCA keyword line
     timeout: int = 900  # seconds per ORCA run
     workdir: str = "orca_runs"

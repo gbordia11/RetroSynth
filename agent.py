@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-from collections import Counter
 
 import dspy
 
@@ -24,7 +23,7 @@ from predictor import SingleStepPredictor
 from ranker import RouteRanker
 from renderer import RouteRenderer
 from search import RetroSearchAgent
-from validator import RouteValidator, format_species
+from validator import RouteValidator
 
 
 class RetroSynth(dspy.Module):
@@ -43,11 +42,7 @@ class RetroSynth(dspy.Module):
         roots = self.search(smile, context=prompt)
         ranked = self.ranker(roots)
         images = self.renderer(ranked)
-        validations = []
-        if self.validator is not None and "[*]" in smile:  # polymer target only
-            for rr in ranked:
-                monomers = format_species(Counter(leaf.smiles for leaf in rr.root.leaves()))
-                validations.append(self.validator(monomers=monomers, polymer=smile))
+        validations = [self.validator(rr.root) for rr in ranked] if self.validator is not None else []
         return dspy.Prediction(routes=ranked, images=images, validations=validations)
 
 
@@ -81,9 +76,14 @@ def main():
             print(f"  ! {issue}")
     for path in result.images:
         print(f"Image: {path}")
+    label = "dG" if config.validator.criterion == "dg" else "dE"
     for i, v in enumerate(result.validations, 1):
-        energy = f", dE={v.delta_e:.1f} kcal/mol" if v.delta_e is not None else ""
-        print(f"Validation route {i}: valid={v.valid}{energy}\n  {v.rationale}")
+        print(f"Validation route {i}: valid={v.valid} favourable={v.favourable}")
+        for s in v.steps:
+            gate = "ok" if s.gate_ok else "FAIL"
+            energy = f" {label}={s.delta:.1f} kcal/mol" if s.delta is not None else ""
+            print(f"  {' + '.join(s.reactants)} -> {s.product}: gate={gate}{energy}")
+        print(f"  {v.rationale}")
 
 
 class PropCalculator(dspy.Module):

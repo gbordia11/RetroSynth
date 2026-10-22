@@ -3,3 +3,4 @@ __pycache__/
 retro_routes/
 .DS_Store
 orca_runs/
+.env
