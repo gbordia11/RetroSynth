@@ -71,6 +71,30 @@ def test_free_energy_differs_from_electronic_energy(validator):
 
 
 @requires_tblite
+def test_hydrogenation_enthalpy_is_negative_and_reverses(validator):
+    forward = validator.step_delta_h("CC", {"C=C": 1, "[H][H]": 1})
+    reverse = validator.step_delta_h("C=C", {"CC": 1})
+    assert forward < 0
+    assert forward == pytest.approx(-reverse, abs=1e-6)
+
+
+@requires_tblite
+def test_free_energy_and_enthalpy_share_one_hessian(validator, monkeypatch):
+    validator.energies.free_energy("C=C")
+    monkeypatch.setattr(validator.energies, "hessian", lambda *a: pytest.fail("Hessian recomputed"))
+    validator.energies.enthalpy("C=C")
+
+
+@requires_tblite
+def test_polyethylene_from_ethylene_is_exergonic_and_exothermic(validator):
+    """The canonical repeat unit (bare * end points) goes through the full dG/dH path."""
+    deltas = validator.step_deltas(canonical("[*]CC[*]"), {"C=C": 1})
+    assert deltas["dH"] < 0  # literature about -22 kcal/mol per repeat unit
+    assert deltas["dG"] < 0
+    assert deltas["dG"] > deltas["dH"]  # the entropy loss on polymerisation opposes it
+
+
+@requires_tblite
 def test_free_energy_is_cached_per_molecule():
     runner = Gfn2Runner()
     first = runner.free_energy("[H][H]")
@@ -84,7 +108,17 @@ def test_dg_criterion_needs_gfn2(tmp_path):
 
 def test_unknown_criterion_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="unknown criterion"):
-        RouteValidator(ValidatorConfig(criterion="dh", workdir=str(tmp_path)))
+        RouteValidator(ValidatorConfig(criterion="dg, ds", workdir=str(tmp_path)))
+
+
+def test_dh_criterion_needs_gfn2(tmp_path):
+    with pytest.raises(ValueError, match="needs backend 'gfn2'"):
+        RouteValidator(ValidatorConfig(backend="orca", criterion="dh", workdir=str(tmp_path)))
+
+
+def test_criteria_list_is_parsed(tmp_path):
+    assert RouteValidator(ValidatorConfig(criterion=" dg ,dh, de ", workdir=str(tmp_path))).criteria == ["dg", "dh", "de"]
+    assert RouteValidator(ValidatorConfig(backend="orca", criterion="de", workdir=str(tmp_path))).criteria == ["de"]
 
 
 def test_unknown_backend_is_rejected(tmp_path):

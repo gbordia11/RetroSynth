@@ -42,11 +42,11 @@ class RendererConfig:
 
 @dataclass
 class ValidatorConfig:
-    """Agent 5: route validator. An LLM calls tools (repeat-unit check, mass balance, ORCA)."""
+    """Agent 5: route validator. An LLM calls tools (repeat-unit check, mass balance, energies)."""
 
     enabled: bool = False  # runs the thermodynamic check on every route when True
     backend: str = "gfn2"  # energy source: "gfn2" (GFN2-xTB via tblite) or "orca"
-    criterion: str = "dg"  # step must have dG < 0 ("dg", needs gfn2) or dE < 0 ("de")
+    criterion: str = "dg, dh"  # every listed change must be < 0: "dg", "dh" (both need gfn2), "de"
     model: str = "mistral/open-mistral-nemo"  # reads MISTRAL_API_KEY from .env
     max_tokens: int = 4000
     max_iters: int = 6  # tool-calling steps before the agent must answer
@@ -57,11 +57,25 @@ class ValidatorConfig:
 
 
 @dataclass
+class OrchestratorConfig:
+    """Claude orchestrator: proposes monomers and steps, and checks them with the validator's tools.
+    Energies use the [validator] backend and criterion."""
+
+    model: str = "anthropic/claude-sonnet-5-5"  # reads ANTHROPIC_API_KEY from .env when backend = api
+    max_tokens: int = 8000  # used by backend = api
+    max_iters: int = 20  # tool calls before the agent must answer
+    backend: str = "api"  # "api" (Anthropic API) or "claude_code" (local `claude -p`, its own login)
+    claude_path: str = "claude"  # Claude Code CLI on PATH, or its full path; backend = claude_code
+    timeout: int = 600  # seconds per Claude Code CLI call; backend = claude_code
+
+
+@dataclass
 class Config:
     predictor: PredictorConfig = field(default_factory=PredictorConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     renderer: RendererConfig = field(default_factory=RendererConfig)
     validator: ValidatorConfig = field(default_factory=ValidatorConfig)
+    orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
 
 
 SECTIONS = {f.name: f.type for f in fields(Config)}

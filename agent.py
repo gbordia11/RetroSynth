@@ -1,10 +1,11 @@
 """Template-free retrosynthesis pipeline driven by a target SMILES.
 
-The four agents live in their own modules:
+The five agents live in their own modules:
 1. predictor.py - SingleStepPredictor: P_ss(target) -> top-K (precursor set, probability).
 2. search.py    - RetroSearchAgent: expands the tree until every leaf is in stock.
 3. ranker.py    - RouteRanker: validates each route and ranks the valid ones.
 4. renderer.py  - RouteRenderer: draws each route with RDKit as a PNG.
+5. validator.py - RouteValidator: chemistry gate, dG/dH check and LLM review (when enabled).
 
 Settings (models, search limits, output folder) come from config.ini.
 This module wires the agents together and provides the command-line entry point.
@@ -23,11 +24,11 @@ from predictor import SingleStepPredictor
 from ranker import RouteRanker
 from renderer import RouteRenderer
 from search import RetroSearchAgent
-from validator import RouteValidator
+from validator import RouteValidator, format_deltas
 
 
 class RetroSynth(dspy.Module):
-    """Runs the four agents on one target molecule."""
+    """Runs the agents on one target molecule; the validator only when enabled in the config."""
 
     def __init__(self, stock, config=None, backend=None):
         super().__init__()
@@ -76,21 +77,14 @@ def main():
             print(f"  ! {issue}")
     for path in result.images:
         print(f"Image: {path}")
-    label = "dG" if config.validator.criterion == "dg" else "dE"
     for i, v in enumerate(result.validations, 1):
         print(f"Validation route {i}: valid={v.valid} favourable={v.favourable}")
         for s in v.steps:
             gate = "ok" if s.gate_ok else "FAIL"
-            energy = f" {label}={s.delta:.1f} kcal/mol" if s.delta is not None else ""
-            print(f"  {' + '.join(s.reactants)} -> {s.product}: gate={gate}{energy}")
+            energy = f" {format_deltas(s.deltas)}" if s.deltas else ""
+            tc = f" Tc={s.ceiling_temperature:.0f} K" if s.ceiling_temperature is not None else ""
+            print(f"  {' + '.join(s.reactants)} -> {s.product}: gate={gate}{energy}{tc}")
         print(f"  {v.rationale}")
-
-
-class PropCalculator(dspy.Module):
-    def __init__(self):
-        return
-    def forward(self):
-        return
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 Each step of the route (reactants -> product) is checked in three stages:
 1. chemistry gate: the reactant atoms cover the product, and the leftover is a known small
    by-product. A polymer step (product with [*] end points) must also be a valid repeat unit.
-2. thermodynamics: each molecule is relaxed and its electronic energy computed with GFN2-xTB
-   (default) or ORCA. The step passes only if its energy change dE is below zero.
+2. thermodynamics: each molecule is relaxed with GFN2-xTB (default) or ORCA. The step passes only
+   if every configured change is below zero: dG and dH at 298 K by default, or dE.
 3. LLM review (only when 1 and 2 pass): a dspy.ReAct agent reads the path and can call tools.
    It can reject a route, but it cannot approve one that fails the thermodynamic check.
 
@@ -25,8 +25,14 @@ from rdkit.Chem import AllChem
 
 from config import ValidatorConfig
 from gfn2 import Gfn2Error, Gfn2Runner
+from molecules import end_points
+from thermo import T_STD
 
 HARTREE_TO_KCAL = 627.5095
+
+# Criteria a step can be checked on: config name -> label. dG and dH need GFN2 thermochemistry.
+CRITERIA = {"dg": "dG", "dh": "dH", "de": "dE"}
+GFN2_ONLY = {"dg", "dh"}
 
 # Small molecules that can appear as by-products, as element counts and SMILES.
 KNOWN_BYPRODUCTS = {
@@ -56,8 +62,19 @@ class StepCheck:
     reactants: list  # SMILES, one entry per reactant molecule
     gate_ok: bool
     message: str
-    delta: float | None = None  # kcal/mol for the criterion (dG or dE), None if no energy
-    note: str = ""  # why delta is missing
+    deltas: dict = field(default_factory=dict)  # label (dG, dH, dE) -> kcal/mol, per the configured criteria
+    note: str = ""  # why the energies are missing
+
+    @property
+    def ceiling_temperature(self):
+        """Tc = dH/dS in K, above which dG > 0. None unless dH < 0 and dS < 0 (dS from dG and dH at 298 K)."""
+        dg, dh = self.deltas.get("dG"), self.deltas.get("dH")
+        if dg is None or dh is None:
+            return None
+        ds = (dh - dg) / T_STD  # kcal/(mol K)
+        if dh >= 0 or ds >= 0:
+            return None
+        return dh / ds
 
 
 @dataclass
@@ -65,7 +82,7 @@ class ValidationResult:
     valid: bool
     rationale: str
     steps: list = field(default_factory=list)  # StepCheck, in route order from the target down
-    favourable: bool = False  # every step has dE < 0
+    favourable: bool = False  # every step has every configured change below zero
 
 
 # --- deterministic chemistry ----------------------------------------------
@@ -141,7 +158,7 @@ def decompose(byproduct):
 def check_step_gate(product, reactants):
     """Gate for one step, reactants -> product. `reactants` is a {smiles: count} dict.
     Return (ok, byproduct Counter, message)."""
-    if "[*]" in product:
+    if end_points(product):
         ok, message = check_repeat_unit(product)
         if not ok:
             return False, Counter(), message
@@ -154,8 +171,14 @@ def check_step_gate(product, reactants):
 
 
 def capped(polymer):
-    """Repeat unit with each [*] replaced by H, giving the repeat unit plus H2."""
-    return Chem.MolToSmiles(Chem.MolFromSmiles(polymer.replace("[*]", "[H]")))
+    """Repeat unit with each [*] (or bare *) replaced by H, giving the repeat unit plus H2."""
+    mol = Chem.RWMol(Chem.MolFromSmiles(polymer))
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            atom.SetAtomicNum(1)
+            atom.SetIsotope(0)
+    Chem.SanitizeMol(mol)
+    return Chem.MolToSmiles(Chem.RemoveHs(mol))
 
 
 def route_steps(root):
@@ -163,13 +186,23 @@ def route_steps(root):
     return [(step.smiles, [child.smiles for child in step.children]) for step in root.steps()]
 
 
-def describe_path(steps, label):
-    """One line per step in forward order: reactants -> product, with gate result and energy change."""
+def format_deltas(deltas):
+    """'dG=-5.1, dH=-20.3 kcal/mol', or '' when there are none."""
+    if not deltas:
+        return ""
+    return ", ".join(f"{label}={value:+.1f}" for label, value in deltas.items()) + " kcal/mol"
+
+
+def describe_path(steps):
+    """One line per step in forward order: reactants -> product, with gate result and energy changes."""
     lines = []
     for i, s in enumerate(reversed(steps), 1):
-        energy = f"{label}={s.delta:.1f} kcal/mol" if s.delta is not None else f"{label} not computed ({s.note})"
+        energy = format_deltas(s.deltas) or f"energies not computed ({s.note})"
         gate = "gate ok" if s.gate_ok else f"gate FAILED: {s.message}"
-        lines.append(f"step {i}: {' + '.join(s.reactants)} -> {s.product} | {gate} | {energy}")
+        line = f"step {i}: {' + '.join(s.reactants)} -> {s.product} | {gate} | {energy}"
+        if s.ceiling_temperature is not None:
+            line += f" | ceiling temperature {s.ceiling_temperature:.0f} K"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -238,9 +271,11 @@ class OrcaRunner:
 
 class ValidateRoute(dspy.Signature):
     """Judge whether this reaction path is a sound synthesis from the starting materials to the target.
-    Every step has passed the atom-balance gate. dE is the energy change of a step in kcal/mol;
-    a step without dE could not be computed. Use the tools to inspect a step or an energy if you
-    need more detail. Give a verdict that cites the steps."""
+    Every step has passed the atom-balance gate and has every listed energy change below zero, in
+    kcal/mol: dG and dH are the free-energy and enthalpy changes at 298 K, dE the electronic-energy
+    change. A ceiling temperature, where given, is the temperature above which dG turns positive.
+    Use the tools to inspect a step or an energy if you need more detail. Give a verdict that cites
+    the steps."""
 
     path: str = dspy.InputField(desc="one line per step, in forward order: reactants -> product")
     valid: bool = dspy.OutputField(desc="true if the reaction path is chemically sound")
@@ -259,10 +294,13 @@ class RouteValidator(dspy.Module):
             self.energies = OrcaRunner(self.config)
         else:
             raise ValueError(f"unknown validator backend {self.config.backend!r}; use 'gfn2' or 'orca'")
-        if self.config.criterion not in ("dg", "de"):
-            raise ValueError(f"unknown criterion {self.config.criterion!r}; use 'dg' or 'de'")
-        if self.config.criterion == "dg" and self.config.backend != "gfn2":
-            raise ValueError("criterion 'dg' needs backend 'gfn2'; ORCA free energies are not implemented")
+        self.criteria = [c.strip() for c in self.config.criterion.split(",") if c.strip()]
+        unknown = [c for c in self.criteria if c not in CRITERIA]
+        if unknown or not self.criteria:
+            raise ValueError(f"unknown criterion {self.config.criterion!r}; use one or more of {sorted(CRITERIA)}")
+        needs_gfn2 = [c for c in self.criteria if c in GFN2_ONLY]
+        if needs_gfn2 and self.config.backend != "gfn2":
+            raise ValueError(f"criterion {needs_gfn2} needs backend 'gfn2'; ORCA free energies and enthalpies are not implemented")
         self.lm = dspy.LM(self.config.model, max_tokens=self.config.max_tokens)
         self.agent = dspy.ReAct(
             ValidateRoute,
@@ -284,31 +322,23 @@ class RouteValidator(dspy.Module):
             return ValidationResult(False, f"rejected by the chemistry gate: {reasons}", steps)
         for s in steps:
             try:
-                s.delta = self.step_delta(s.product, Counter(s.reactants))
+                s.deltas = self.step_deltas(s.product, Counter(s.reactants))
             except ENERGY_ERRORS as exc:
                 s.note = str(exc)
-        label = self.criterion_label
-        unfavourable = [s for s in steps if s.delta is None or s.delta >= 0]
+        unfavourable = [s for s in steps if not s.deltas or any(v >= 0 for v in s.deltas.values())]
         if unfavourable:
-            reasons = "; ".join(
-                f"{s.product}: " + (f"{label}={s.delta:+.1f} kcal/mol" if s.delta is not None else f"no energy ({s.note})")
-                for s in unfavourable
-            )
-            return ValidationResult(False, f"not thermodynamically favourable ({label}): {reasons}", steps, favourable=False)
+            reasons = "; ".join(f"{s.product}: {format_deltas(s.deltas) or f'no energy ({s.note})'}" for s in unfavourable)
+            labels = "/".join(CRITERIA[c] for c in self.criteria)
+            return ValidationResult(False, f"not thermodynamically favourable ({labels}): {reasons}", steps, favourable=False)
         with dspy.context(lm=self.lm):
-            pred = self.agent(path=describe_path(steps, label))
+            pred = self.agent(path=describe_path(steps))
         # The LLM can only reject a route that passed the energy check, never approve one that failed it.
         return ValidationResult(_as_bool(pred.valid), pred.rationale, steps, favourable=True)
 
-    @property
-    def criterion_label(self):
-        return "dG" if self.config.criterion == "dg" else "dE"
-
-    def step_delta(self, product, reactants):
-        """The change the validator checks, dG or dE per the config, in kcal/mol."""
-        if self.config.criterion == "dg":
-            return self.step_delta_g(product, reactants)
-        return self.step_delta_e(product, reactants)
+    def step_deltas(self, product, reactants):
+        """The changes the validator checks, per the configured criteria: {label: kcal/mol}."""
+        compute = {"dg": self.step_delta_g, "dh": self.step_delta_h, "de": self.step_delta_e}
+        return {CRITERIA[c]: compute[c](product, reactants) for c in self.criteria}
 
     def step_delta_e(self, product, reactants):
         """Electronic-energy change dE of one step, reactants -> product + by-product, kcal/mol. Negative is favourable."""
@@ -320,15 +350,21 @@ class RouteValidator(dspy.Module):
             raise OrcaError("free energies are implemented for backend gfn2 only")
         return self._step_change(product, reactants, self.energies.free_energy)
 
+    def step_delta_h(self, product, reactants):
+        """Enthalpy change dH of one step at 298 K, kcal/mol. Negative is exothermic. Needs backend gfn2."""
+        if not hasattr(self.energies, "enthalpy"):
+            raise OrcaError("enthalpies are implemented for backend gfn2 only")
+        return self._step_change(product, reactants, self.energies.enthalpy)
+
     @staticmethod
     def _step_change(product, reactants, quantity):
-        """Change of `quantity` (energy or free energy, Hartree per molecule) over one step, in kcal/mol."""
+        """Change of `quantity` (energy, enthalpy or free energy, Hartree per molecule) over one step, in kcal/mol."""
         ok, byproduct, message = check_step_gate(product, reactants)
         if not ok:
             raise ValueError(message)
         parts = decompose(byproduct)
         q_h2 = quantity(KNOWN_BYPRODUCTS["H2"][1])
-        if "[*]" in product:
+        if end_points(product):
             q_product = quantity(capped(product)) - q_h2  # capped repeat unit = RU + H2
         else:
             q_product = quantity(product)
@@ -355,10 +391,10 @@ class RouteValidator(dspy.Module):
             return f"error: {exc}"
 
     def step_energy(self, product: str, reactants: str) -> str:
-        """Energy change of one step in kcal/mol, dG or dE per the validator's criterion.
+        """Energy changes of one step in kcal/mol (dG, dH or dE, per the validator's criteria).
         reactants: comma-separated SMILES with optional ':count'."""
         try:
-            return f"{self.step_delta(product, parse_species(reactants)):.2f} kcal/mol ({self.criterion_label})"
+            return format_deltas(self.step_deltas(product, parse_species(reactants)))
         except ENERGY_ERRORS as exc:
             return f"error: {exc}"
 
