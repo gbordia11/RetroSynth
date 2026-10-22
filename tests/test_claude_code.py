@@ -190,3 +190,96 @@ def test_orchestrator_runs_its_react_loop_through_the_cli(fake_cli):
     assert result.trajectory["observation_0"].startswith("PASS")
     assert len(calls()) == 3  # two ReAct rounds and the final answer, one CLI call each
     assert "PASS" in calls()[1]["stdin"]  # the tool result is sent back to Claude in the next call
+
+
+# --- replies that drift from dspy's format -----------------------------------------------
+
+REACT_PROMPT = ("[[ ## target ## ]]\n[*]CC[*]\n\nRespond with the corresponding output fields, starting with the field "
+                "`[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]`, then `[[ ## next_tool_args ## ]]`, "
+                "and then ending with the marker for `[[ ## completed ## ]]`.")
+GOOD = fields(next_thought="Check stock.", next_tool_name="in_stock", next_tool_args={"smiles": "C=C"})
+# What Claude Code returned in a real nylon-6,6 run: the thought as plain text, then tool-call markup.
+DRIFTED = ('Adipoyl chloride is not in stock, so check other reagents.\n\n<invoke name="in_stock">\n'
+           '<parameter name="smiles">NC(N)=O</parameter>\n</invoke>')
+
+
+def test_format_problem_names_missing_fields_and_tool_markup():
+    from orchestrator import format_problem
+
+    assert format_problem(REACT_PROMPT, GOOD) == ""
+    problem = format_problem(REACT_PROMPT, DRIFTED)
+    assert "[[ ## next_thought ## ]]" in problem and "[[ ## completed ## ]]" in problem
+    assert "tool-call markup" in problem
+    assert format_problem("no dspy instructions here", DRIFTED) == ""  # other prompts are not checked
+
+
+def test_engine_asks_again_when_a_reply_drifts_from_the_format(fake_cli):
+    cli, set_replies, calls = fake_cli
+    set_replies([DRIFTED, GOOD])
+    response = ClaudeCodeEngine(cli).complete(Request(model="m", messages=(Message.user(REACT_PROMPT),)))
+    assert response.message.text == GOOD
+    assert len(calls()) == 2
+    retry = calls()[1]["stdin"]
+    assert DRIFTED in retry and "did not follow the required format" in retry
+    assert (response.usage.input_tokens, response.usage.output_tokens) == (10, 4)  # both calls counted
+
+
+def test_engine_does_not_retry_a_good_reply(fake_cli):
+    cli, set_replies, calls = fake_cli
+    set_replies([GOOD])
+    ClaudeCodeEngine(cli).complete(Request(model="m", messages=(Message.user(REACT_PROMPT),)))
+    assert len(calls()) == 1
+
+
+def test_system_prompt_says_there_are_no_native_tools(fake_cli):
+    cli, set_replies, calls = fake_cli
+    set_replies([GOOD])
+    ClaudeCodeEngine(cli).complete(Request(model="m", messages=(Message.user(REACT_PROMPT),), system="dspy rules"))
+    argv = calls()[0]["argv"]
+    system = argv[argv.index("--system-prompt") + 1]
+    assert system.startswith("dspy rules") and "no native tools" in system and "<invoke>" in system
+
+
+def test_cli_prints_a_clear_message_when_a_reply_cannot_be_read(tmp_path, monkeypatch, capsys):
+    import orchestrator
+    from dspy.utils.exceptions import AdapterParseError
+
+    from orchestrator import PlanSynthesis
+
+    stock = tmp_path / "stock.smi"
+    stock.write_text("C=C\n")
+
+    def broken(self, target, context=""):
+        raise AdapterParseError("ChatAdapter", PlanSynthesis, DRIFTED)
+
+    monkeypatch.setattr(orchestrator.RetroOrchestrator, "forward", broken)
+    monkeypatch.setattr(sys, "argv", ["orchestrator.py", PE_RU, "--stock", str(stock), "--quiet"])
+    with pytest.raises(SystemExit) as exit_info:
+        orchestrator.main()
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Stopped: Claude's reply could not be read as steps, rationale" in err
+    assert '<invoke name="in_stock">' in err
+    assert "Traceback" not in err
+
+
+def test_cli_prints_a_clear_message_when_the_lm_call_fails(tmp_path, monkeypatch, capsys):
+    """For example the safeguard refusal seen in a live nylon-6,6 run: no traceback, the provider's message."""
+    import orchestrator
+    from dspy.utils.exceptions import LMProviderError
+
+    stock = tmp_path / "stock.smi"
+    stock.write_text("C=C\n")
+    message = "Claude Code CLI returned an error: API Error: safeguards flagged this message"
+
+    def refused(self, target, context=""):
+        raise LMProviderError(message)
+
+    monkeypatch.setattr(orchestrator.RetroOrchestrator, "forward", refused)
+    monkeypatch.setattr(sys, "argv", ["orchestrator.py", PE_RU, "--stock", str(stock), "--quiet"])
+    with pytest.raises(SystemExit) as exit_info:
+        orchestrator.main()
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Stopped: the call to Claude failed." in err and "safeguards flagged" in err
+    assert "Traceback" not in err

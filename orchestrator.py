@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from dspy.clients.engines.base import validate_request
 from dspy.lm15 import ConfigurationError, Message, ProviderError, Response, TextPart, Usage, response_to_events
 from dspy.lm15 import TimeoutError as LMTimeoutError
 from dspy.utils.callback import BaseCallback
+from dspy.utils.exceptions import AdapterParseError, LMError
 
 from config import DEFAULT_CONFIG_PATH, Config, load_config
 from molecules import TreeNode, canonical, load_stock
@@ -125,10 +127,31 @@ class ClaudeCodeEngine:
             body = conversation[0][1]
         else:  # few-shot demos or history: keep the turns labelled
             body = "\n\n".join(f"{role}:\n{text}" for role, text in conversation)
+        system += NO_TOOL_MARKUP
+        text, tokens_in, tokens_out = self._ask(request.model, system, body)
+        problem = format_problem(body, text)
+        if problem:
+            # Claude drifted from dspy's reply format (seen in long ReAct runs). Show it its reply
+            # and what was wrong, and ask once more; if that also fails, dspy reports the parse error.
+            retry = (f"{body}\n\nassistant:\n{text}\n\nuser:\nYour reply above did not follow the required "
+                     f"format: {problem}. Reply again from the start, with every required [[ ## field ## ]] section "
+                     f"in order and no tool-call markup.")
+            text, more_in, more_out = self._ask(request.model, system, retry)
+            tokens_in, tokens_out = tokens_in + more_in, tokens_out + more_out
+        return Response(
+            id=None,
+            model=request.model,
+            message=Message.assistant([TextPart(text)]),
+            finish_reason="stop",
+            usage=Usage(input_tokens=tokens_in, output_tokens=tokens_out, total_tokens=tokens_in + tokens_out),
+        )
+
+    def _ask(self, model, system, body):
+        """One `claude -p` call. Returns (reply text, input tokens, output tokens)."""
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
         try:
             proc = subprocess.run(
-                self.command(request.model, system), input=body, capture_output=True, text=True,
+                self.command(model, system), input=body, capture_output=True, text=True,
                 timeout=self.timeout, env=env, cwd=tempfile.gettempdir(),  # away from the project's CLAUDE.md
             )
         except FileNotFoundError as exc:
@@ -143,14 +166,7 @@ class ClaudeCodeEngine:
         if data.get("is_error") or proc.returncode != 0:
             raise ProviderError(f"Claude Code CLI returned an error: {str(data.get('result', data))[:500]}", provider="claude_code")
         usage = data.get("usage") or {}
-        tokens_in, tokens_out = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
-        return Response(
-            id=data.get("session_id"),
-            model=request.model,
-            message=Message.assistant([TextPart(data.get("result", ""))]),
-            finish_reason="stop",
-            usage=Usage(input_tokens=tokens_in, output_tokens=tokens_out, total_tokens=tokens_in + tokens_out),
-        )
+        return data.get("result", ""), usage.get("input_tokens", 0), usage.get("output_tokens", 0)
 
     def stream(self, request):
         return response_to_events(self.complete(request))
@@ -165,6 +181,35 @@ class ClaudeCodeEngine:
     @classmethod
     def load_state(cls, state):
         return cls(**state)
+
+
+# Appended to dspy's system prompt for the CLI. Claude Code's model knows native tool calling, and in
+# long ReAct runs it sometimes writes <invoke ...> markup instead of dspy's [[ ## field ## ]] reply.
+NO_TOOL_MARKUP = (
+    "\n\nYou have no native tools in this conversation. Never write function-call or tool-use markup "
+    "such as <invoke> or <function_calls>. When you are asked to choose a tool, write its name and "
+    "arguments in the requested [[ ## field ## ]] sections, and reply only in the format described above."
+)
+TOOL_MARKUP = re.compile(r"<(invoke|function_calls|tool_call|antml:invoke)\b")
+
+
+def format_problem(prompt, reply):
+    """What is wrong with `reply` against dspy's ChatAdapter instructions in `prompt`, or '' if nothing.
+
+    dspy ends its prompt with "Respond with the corresponding output fields, starting with the field
+    `[[ ## a ## ]]`, then ..., and then ending with the marker for `[[ ## completed ## ]]`." Every field
+    named there must appear in the reply. Prompts without that sentence are not checked."""
+    instruction = re.search(r"Respond with the corresponding output fields(.*?)(?:\n\n|$)", prompt, re.S)
+    if not instruction:
+        return ""
+    required = re.findall(r"\[\[ ## (\w+) ## \]\]", instruction.group(1))
+    missing = [name for name in required if f"[[ ## {name} ## ]]" not in reply]
+    problems = []
+    if missing:
+        problems.append("it is missing " + ", ".join(f"[[ ## {name} ## ]]" for name in missing))
+    if TOOL_MARKUP.search(reply):
+        problems.append("it contains tool-call markup, but you have no native tools")
+    return " and ".join(problems)
 
 
 def make_lm(config):
@@ -462,7 +507,22 @@ def main():
     printer = None if args.quiet else ProgressPrinter()
     if printer:
         printer.header(args.target, config)
-    result = RetroOrchestrator(stock, config, progress=printer)(args.target, context=args.context)
+    try:
+        result = RetroOrchestrator(stock, config, progress=printer)(args.target, context=args.context)
+    except AdapterParseError as exc:
+        reply = str(exc.lm_response or "").strip()
+        expected = ", ".join(exc.signature.output_fields) if exc.signature is not None else "the expected fields"
+        print(f"\nStopped: Claude's reply could not be read as {expected}.", file=sys.stderr)
+        if reply:
+            print("Claude's reply was:\n" + textwrap.indent(reply[:2000], "  "), file=sys.stderr)
+        print("Run the command again; a long run can drift from the format. A narrower --context can help.", file=sys.stderr)
+        sys.exit(1)
+    except LMError as exc:
+        # A refused or failed LM call (safeguard flag, auth, billing, rate limit, timeout): the
+        # provider's message says what happened; the traceback adds nothing for the user.
+        print(f"\nStopped: the call to Claude failed.\n{textwrap.indent(str(exc).strip(), '  ')}", file=sys.stderr)
+        print("Run the command again, or set a different `model` (or `backend`) in [orchestrator].", file=sys.stderr)
+        sys.exit(1)
 
     print()
     print(f"Route valid={result.valid}")
