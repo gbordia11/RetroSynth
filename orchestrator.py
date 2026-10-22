@@ -9,15 +9,24 @@ Claude's answer is then re-checked without the LLM: every step must pass the gat
 configured energy change below zero, and every starting material must be in stock. Claude can
 propose a route, but only the tools can make it valid.
 
+While it runs, the CLI prints each step as it happens: Claude's thoughts, every tool call and its
+result, and the re-check of each reaction step. Pass --quiet to print only the result.
+
 Usage:
-    python orchestrator.py "[*]CC[*]" --stock stock.smi [--context TEXT] [--config config.ini]
+    python orchestrator.py "[*]CC[*]" --stock stock.smi [--context TEXT] [--config config.ini] [--quiet]
 """
 
 import argparse
+import os
+import shutil
+import sys
+import textwrap
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 
 import dspy
+from dspy.utils.callback import BaseCallback
 
 from config import DEFAULT_CONFIG_PATH, Config, load_config
 from molecules import TreeNode, canonical, load_stock
@@ -101,13 +110,65 @@ def route_from_steps(steps, target):
     return root, issues
 
 
-class RetroOrchestrator(dspy.Module):
-    """Claude proposes monomers and steps, validates them with tools, and the result is re-checked."""
+class ProgressCallback(BaseCallback):
+    """Turns dspy's ReAct events into progress events, so a caller can show each step as it happens.
 
-    def __init__(self, stock, config=None):
+    `report(event, data)` is called with:
+      "thinking"     {"iteration"}                              Claude is choosing its next action
+      "thought"      {"iteration", "thought", "tool", "args"}   Claude's reasoning and the tool it chose
+      "tool_start"   {"iteration", "tool", "args"}              a tool started
+      "tool_end"     {"iteration", "tool", "result", "seconds"} a tool finished
+      "answering"    {}                                         Claude is writing the final answer
+    """
+
+    def __init__(self, agent, report):
+        self.agent = agent  # the dspy.ReAct instance
+        self.report = report
+        self.iteration = 0
+        self._calls = {}  # call_id -> what started, so the matching end event can be named
+
+    def on_module_start(self, call_id, instance, inputs):
+        if instance is self.agent.react:
+            self.iteration += 1
+            self._calls[call_id] = "react"
+            self.report("thinking", {"iteration": self.iteration})
+        elif instance is self.agent.extract:
+            self.report("answering", {})
+
+    def on_module_end(self, call_id, outputs, exception=None):
+        if self._calls.pop(call_id, None) == "react" and outputs is not None:
+            self.report("thought", {
+                "iteration": self.iteration,
+                "thought": outputs.next_thought,
+                "tool": outputs.next_tool_name,
+                "args": outputs.next_tool_args,
+            })
+
+    def on_tool_start(self, call_id, instance, inputs):
+        name = getattr(instance, "name", str(instance))
+        self._calls[call_id] = (name, time.monotonic())
+        self.report("tool_start", {"iteration": self.iteration, "tool": name, "args": inputs})
+
+    def on_tool_end(self, call_id, outputs, exception=None):
+        name, started = self._calls.pop(call_id, ("?", time.monotonic()))
+        result = f"error: {exception}" if exception is not None else outputs
+        self.report("tool_end", {
+            "iteration": self.iteration, "tool": name, "result": result, "seconds": time.monotonic() - started,
+        })
+
+
+class RetroOrchestrator(dspy.Module):
+    """Claude proposes monomers and steps, validates them with tools, and the result is re-checked.
+
+    `progress`, if given, is called as progress(event, data) while the orchestrator runs: the
+    ProgressCallback events, then "recheck_start" {"n_steps"}, "recheck_step" {"index", "step"} and
+    "recheck_done" {"valid", "issues"}."""
+
+    def __init__(self, stock, config=None, progress=None):
         super().__init__()
         self.config = config or Config()
         self.stock = stock
+        self.progress = progress
         self.validator = RouteValidator(self.config.validator)  # gate and energies; its LLM review is not used
         self.lm = dspy.LM(self.config.orchestrator.model, max_tokens=self.config.orchestrator.max_tokens)
         self.agent = dspy.ReAct(
@@ -117,7 +178,8 @@ class RetroOrchestrator(dspy.Module):
         )
 
     def forward(self, target, context=""):
-        with dspy.context(lm=self.lm):
+        callbacks = [ProgressCallback(self.agent, self.progress)] if self.progress else []
+        with dspy.context(lm=self.lm, callbacks=callbacks):
             pred = self.agent(target=target, context=context)
         steps = pred.steps if isinstance(pred.steps, list) else str(pred.steps).splitlines()
         result = self.check(target, [s for s in steps if s.strip()])
@@ -130,8 +192,11 @@ class RetroOrchestrator(dspy.Module):
         root, issues = route_from_steps(steps, target)
         checks = []
         if root is not None:
-            for product, reactants in reversed(route_steps(root)):
+            forward_steps = list(reversed(route_steps(root)))
+            self._report("recheck_start", {"n_steps": len(forward_steps)})
+            for i, (product, reactants) in enumerate(forward_steps, 1):
                 checks.append(self._check_step(product, Counter(reactants)))
+                self._report("recheck_step", {"index": i, "step": checks[-1]})
             for s in checks:
                 if not s.gate_ok:
                     issues.append(f"{s.product}: gate failed: {s.message}")
@@ -140,7 +205,13 @@ class RetroOrchestrator(dspy.Module):
                 elif any(v >= 0 for v in s.deltas.values()):
                     issues.append(f"{s.product}: not favourable: {format_deltas(s.deltas)}")
             issues += [f"not in stock: {leaf.smiles}" for leaf in root.leaves() if leaf.smiles not in self.stock]
-        return OrchestratorResult(valid=root is not None and not issues, rationale="", steps=checks, issues=issues, root=root)
+        valid = root is not None and not issues
+        self._report("recheck_done", {"valid": valid, "issues": issues})
+        return OrchestratorResult(valid=valid, rationale="", steps=checks, issues=issues, root=root)
+
+    def _report(self, event, data):
+        if self.progress:
+            self.progress(event, data)
 
     def _check_step(self, product, reactants):
         """StepCheck for one step; `reactants` is a {smiles: count} dict. Energies only if the gate passes."""
@@ -187,31 +258,99 @@ class RetroOrchestrator(dspy.Module):
         return "\n".join(lines)
 
 
+class ProgressPrinter:
+    """Prints orchestrator progress events as they arrive, one block per Claude iteration."""
+
+    def __init__(self, stream=None, color=None):
+        self.stream = stream or sys.stdout
+        if color is None:
+            color = self.stream.isatty() and "NO_COLOR" not in os.environ
+        self.color = color
+        self.width = min(shutil.get_terminal_size((100, 20)).columns, 110)
+        self.started = time.monotonic()
+
+    def _style(self, text, code):
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def _print(self, text="", indent=""):
+        for line in text.splitlines() or [""]:
+            wrapped = textwrap.wrap(line, self.width - len(indent), subsequent_indent="  ") or [""]
+            for part in wrapped:
+                print(indent + part, file=self.stream, flush=True)
+
+    def header(self, target, config):
+        criteria = ", ".join(c.strip() for c in config.validator.criterion.split(","))
+        self._print(self._style(f"Target  {target}", "1"))
+        self._print(f"Claude  {config.orchestrator.model}  |  energies  {config.validator.backend} ({criteria})"
+                    f"  |  up to {config.orchestrator.max_iters} tool calls")
+
+    def __call__(self, event, data):
+        clock = self._style(f"{time.monotonic() - self.started:6.1f}s", "2")
+        if event == "thinking":
+            self._print()
+            label = self._style(f"[{data['iteration']}]", "1")
+            self._print(f"{clock}  {label} Claude is thinking...")
+        elif event == "thought":
+            self._print(self._style("Thought: ", "36") + str(data["thought"]), indent="         ")
+            if data["tool"] != "finish":
+                self._print(f"Next: {data['tool']}({format_args(data['args'])})", indent="         ")
+        elif event == "tool_start":
+            if data["tool"] == "finish":
+                self._print(f"{clock}  Claude is done with the tools.")
+            else:
+                busy = " (gate, then energies; this can take a while)" if data["tool"] == "validate_step" else ""
+                self._print(f"{clock}  -> {data['tool']}{busy}")
+        elif event == "tool_end" and data["tool"] != "finish":
+            result = str(data["result"])
+            code = "32" if result.startswith(("PASS", "in stock")) else ("31" if "FAIL" in result or "NOT" in result else "0")
+            self._print(f"{clock}  <- {self._style(result, code)}  ({data['seconds']:.1f} s)")
+        elif event == "answering":
+            self._print()
+            self._print(f"{clock}  Claude is writing its answer...")
+        elif event == "recheck_start":
+            self._print()
+            self._print(self._style(f"Re-checking Claude's {data['n_steps']} step(s) without the LLM", "1"))
+        elif event == "recheck_step":
+            self._print(format_step(data["index"], data["step"], self._style), indent="  ")
+        elif event == "recheck_done":
+            verdict = self._style("VALID", "32;1") if data["valid"] else self._style("NOT VALID", "31;1")
+            self._print(f"{clock}  Route is {verdict}")
+
+
+def format_args(args):
+    """{'product': 'C=C', 'reactants': 'CC'} -> 'product=C=C, reactants=CC'."""
+    if isinstance(args, dict):
+        return ", ".join(f"{k}={v}" for k, v in args.items())
+    return str(args)
+
+
+def format_step(index, step, style=lambda text, code: text):
+    gate = style("gate ok", "32") if step.gate_ok else style(f"gate FAILED: {step.message}", "31")
+    energy = f"  {format_deltas(step.deltas)}" if step.deltas else (f"  no energy: {step.note}" if step.note else "")
+    tc = f"  Tc={step.ceiling_temperature:.0f} K" if step.ceiling_temperature is not None else ""
+    return f"step {index}: {' + '.join(step.reactants)} -> {step.product}  {gate}{energy}{tc}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Claude orchestrator: monomers and validated reaction steps")
     parser.add_argument("target", help="target SMILES, or polymer PSMILES with [*] end points")
     parser.add_argument("--stock", required=True, help="building blocks file, one SMILES per line")
     parser.add_argument("--context", default="", help="extra instructions for Claude")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="settings file (INI)")
+    parser.add_argument("--quiet", action="store_true", help="print only the result, not each step as it happens")
     args = parser.parse_args()
 
     config = load_config(args.config)
     stock = load_stock(args.stock)
-    result = RetroOrchestrator(stock, config)(args.target, context=args.context)
+    printer = None if args.quiet else ProgressPrinter()
+    if printer:
+        printer.header(args.target, config)
+    result = RetroOrchestrator(stock, config, progress=printer)(args.target, context=args.context)
 
-    n = sum(1 for key in result.trajectory if key.startswith("tool_name_"))
-    print(f"Claude made {n} tool call(s):")
-    for i in range(n):
-        args_i = result.trajectory.get(f"tool_args_{i}", {})
-        print(f"  {result.trajectory[f'tool_name_{i}']}({args_i})")
-        observation = str(result.trajectory.get(f"observation_{i}", "")).splitlines()
-        print(f"    -> {observation[0] if observation else ''}")
+    print()
     print(f"Route valid={result.valid}")
     for i, s in enumerate(result.steps, 1):
-        gate = "ok" if s.gate_ok else "FAIL"
-        energy = f" {format_deltas(s.deltas)}" if s.deltas else ""
-        tc = f" Tc={s.ceiling_temperature:.0f} K" if s.ceiling_temperature is not None else ""
-        print(f"  step {i}: {' + '.join(s.reactants)} -> {s.product}: gate={gate}{energy}{tc}")
+        print("  " + format_step(i, s))
     for issue in result.issues:
         print(f"  ! {issue}")
     print(f"Claude: {result.rationale}")

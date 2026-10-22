@@ -223,7 +223,28 @@ When a step fails, Claude revises it and validates again. It returns the path as
 python orchestrator.py "[*]CC[*]" --stock stock.smi
 ```
 
-This needs `ANTHROPIC_API_KEY` in `.env`. The output lists Claude's tool calls, each validated step with its energies, any issues, Claude's rationale, and a PNG of the route. From Python:
+This needs `ANTHROPIC_API_KEY` in `.env`. While it runs, the CLI shows each step as it happens:
+
+```
+Target  [*]CC[*]
+Claude  anthropic/claude-sonnet-5-5  |  energies  gfn2 (dg, dh)  |  up to 20 tool calls
+
+   2.1s  [1] Claude is thinking...
+         Thought: Ethylene undergoes addition polymerisation; validate that step.
+         Next: validate_step(product=[*]CC[*], reactants=C=C)
+   2.1s  -> validate_step (gate, then energies; this can take a while)
+  14.8s  <- PASS: gate ok (atoms balance; by-product (none)); dG=-34.7, dH=-43.6 kcal/mol; ceiling temperature 1462 K  (12.7 s)
+
+  16.0s  [2] Claude is thinking...
+         ...
+Re-checking Claude's 1 step(s) without the LLM
+  step 1: C=C -> *CC*  gate ok  dG=-34.7, dH=-43.6 kcal/mol  Tc=1462 K
+  31.5s  Route is VALID
+```
+
+Each numbered block is one round of Claude's reasoning: its thought, the tool it chose, and the tool's result with how long it took. After Claude answers, every step is re-checked and the verdict printed, followed by a summary, Claude's rationale, and a PNG of the route. Pass `--quiet` to print only the summary. Colour is used in a terminal and turned off when the output is piped or `NO_COLOR` is set.
+
+From Python, pass `progress=` to receive the same events (`thinking`, `thought`, `tool_start`, `tool_end`, `answering`, `recheck_start`, `recheck_step`, `recheck_done`), or leave it out to run silently:
 
 ```python
 from orchestrator import RetroOrchestrator

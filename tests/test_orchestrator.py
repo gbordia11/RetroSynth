@@ -129,3 +129,65 @@ def test_shipped_config_has_orchestrator_section():
     config = load_config()
     assert config.orchestrator.model.startswith("anthropic/")
     assert config.orchestrator.max_iters > 0
+
+
+# --- live progress (CLI) -------------------------------------------------------------
+
+def run_with_progress(steps):
+    events = []
+    orch = orchestrator()
+    orch.lm = scripted(steps)
+    orch.progress = lambda event, data: events.append((event, data))
+    return orch(PE_RU), events
+
+
+def test_progress_reports_each_iteration_in_order():
+    _, events = run_with_progress(["C=C>>[*]CC[*]"])
+    names = [e for e, _ in events]
+    assert names[:5] == ["thinking", "thought", "tool_start", "tool_end", "thinking"]
+    assert names[-3:] == ["recheck_start", "recheck_step", "recheck_done"]
+    assert "answering" in names
+    thought = next(d for e, d in events if e == "thought")
+    assert thought["iteration"] == 1 and thought["tool"] == "validate_step"
+    assert thought["args"] == {"product": PE_RU, "reactants": "C=C"}
+
+
+def test_progress_tool_end_carries_the_result_and_time():
+    _, events = run_with_progress(["C=C>>[*]CC[*]"])
+    ends = [d for e, d in events if e == "tool_end" and d["tool"] != "finish"]
+    assert [d["tool"] for d in ends] == ["validate_step", "in_stock"]
+    assert ends[0]["result"].startswith("PASS")
+    assert all(d["seconds"] >= 0 for d in ends)
+
+
+def test_progress_recheck_reports_the_verdict():
+    _, events = run_with_progress(["C=C>>[*]CC(N)[*]"])
+    done = next(d for e, d in events if e == "recheck_done")
+    assert done["valid"] is False and done["issues"]
+
+
+def test_no_progress_callback_without_a_reporter():
+    orch = orchestrator()
+    orch.lm = scripted(["C=C>>[*]CC[*]"])
+    assert orch(PE_RU).valid  # runs with progress=None and reports nothing
+
+
+def test_printer_shows_thoughts_tool_calls_results_and_recheck():
+    import io
+
+    from orchestrator import ProgressPrinter
+
+    out = io.StringIO()
+    printer = ProgressPrinter(stream=out, color=False)
+    orch = orchestrator()
+    orch.lm = scripted(["C=C>>[*]CC[*]"])
+    orch.progress = printer
+    printer.header(PE_RU, orch.config)
+    orch(PE_RU)
+    text = out.getvalue()
+    for expected in ["Target  [*]CC[*]", "[1] Claude is thinking", "Thought: Ethylene polymerises",
+                     "Next: validate_step(product=[*]CC[*], reactants=C=C)", "-> validate_step",
+                     "<- PASS", "-> in_stock", "<- C=C: in stock", "Claude is writing its answer",
+                     "Re-checking Claude's 1 step(s)", "step 1: C=C -> *CC*  gate ok", "Route is VALID"]:
+        assert expected in text, expected
+    assert "\033[" not in text  # no colour codes when color=False
